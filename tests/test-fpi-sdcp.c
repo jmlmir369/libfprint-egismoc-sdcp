@@ -130,13 +130,20 @@ test_verify_connect (void)
 
   g_autoptr(GBytes) expected_application_secret = g_bytes_from_hex (application_secret_hex);
 
+  /* This published vector has a trusted certificate but an unrelated model
+   * signature. It remains useful as a KDF/MAC vector, never as attestation. */
+  g_assert_true (fpi_sdcp_verify_attestation (claim, TRUE, FALSE, &error));
+  g_assert_no_error (error);
+  g_assert_false (fpi_sdcp_verify_attestation (claim, TRUE, TRUE, &error));
+  g_assert_nonnull (error);
+  g_clear_error (&error);
   g_assert_true (fpi_sdcp_verify_connect (host_private_key,
                                           host_random,
                                           device_random,
                                           claim,
                                           connect_mac,
-                                          TRUE,
-                                          TRUE,
+                                          FALSE,
+                                          FALSE,
                                           &application_secret,
                                           &error));
 

@@ -98,6 +98,9 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (FpiSdcpClaim, fpi_sdcp_claim_free)
  * @identify: Start identification process. On completion, the driver must call
  *   fpi_sdcp_device_identify_complete(). To request the user to retry the
  *   fpi_sdcp_device_identify_retry() function is used.
+ * @require_fresh_connect: Verify a new complete connection before every open
+ *   and authentication. Required when the driver cannot provide a fresh
+ *   Identify nonce. A failed handshake must not reuse persisted SDCP data.
  *
  * These are the main entry points for drivers implementing SDCP.
  *
@@ -129,6 +132,8 @@ struct _FpSdcpDeviceClass
 
   gboolean      ignore_device_certificate;
   gboolean      ignore_device_signatures;
+  /* Rekey before every authentication when an Identify nonce is not fresh. */
+  gboolean      require_fresh_connect;
 
   void          (*open)          (FpSdcpDevice *sdcp_device);
   void          (*connect)       (FpSdcpDevice *sdcp_device);

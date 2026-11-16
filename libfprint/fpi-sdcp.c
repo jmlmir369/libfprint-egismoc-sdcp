@@ -32,6 +32,8 @@
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/x509.h>
+#include <openssl/ecdsa.h>
+#include <openssl/crypto.h>
 
 #define SDCP_PRIVATE_KEY_SIZE 32
 #define SDCP_KEY_AGREEMENT_SIZE 32
@@ -53,171 +55,115 @@ print_openssl_errors (void)
     }
 }
 
-static void
-print_certificate (X509 *certificate)
-{
-  BIO *bio = BIO_new (BIO_s_mem ());
-  BUF_MEM *bio_mem = NULL;
-
-  X509_print (bio, certificate);
-  BIO_get_mem_ptr (bio, &bio_mem);
-  fp_dbg ("SDCP Device reported the following model certificate:\n%.*s\n",
-          (int) bio_mem->length, bio_mem->data);
-  BIO_free (bio);
-}
-
 /******************************************************************************/
 
 static gboolean
 fpi_sdcp_verify_signature (EVP_PKEY    *pkey,
-                           const gchar *label,
+                           const guint8 *prefix,
+                           gsize        prefix_len,
                            GBytes      *data_a,
                            GBytes      *data_b,
                            GBytes      *signature,
                            GError     **error)
 {
   EVP_MD_CTX *mdctx = NULL;
-  EVP_PKEY_CTX *pctx = NULL;
+  ECDSA_SIG *ec_signature = NULL;
+  BIGNUM *r = NULL, *s = NULL;
+  const guint8 *raw;
+  unsigned char *der = NULL;
+  int der_len;
+  gboolean valid = FALSE;
 
-  mdctx = EVP_MD_CTX_create ();
-  pctx = EVP_PKEY_CTX_new (pkey, NULL);
-  EVP_MD_CTX_set_pkey_ctx (mdctx, pctx);
-
-  if (!EVP_DigestVerifyInit (mdctx, NULL, EVP_sha256 (), NULL, pkey))
+  if (!pkey || !signature || g_bytes_get_size (signature) != SDCP_SIGNATURE_SIZE)
     goto out_error;
-
-  if (label)
-    if (!EVP_DigestVerifyUpdate (mdctx, label, strlen (label)))
-      goto out_error;
-
-  if (data_a)
-    {
-      if (!EVP_DigestVerifyUpdate (mdctx,
-                                   g_bytes_get_data (data_a, NULL),
-                                   g_bytes_get_size (data_a)))
-        goto out_error;
-    }
-
-  if (data_b)
-    {
-      if (!EVP_DigestVerifyUpdate (mdctx,
-                                   g_bytes_get_data (data_b, NULL),
-                                   g_bytes_get_size (data_b)))
-        goto out_error;
-    }
-
-  if (!EVP_DigestVerifyUpdate (mdctx,
-                               g_bytes_get_data (signature, NULL),
-                               g_bytes_get_size (signature)))
+  raw = g_bytes_get_data (signature, NULL);
+  r = BN_bin2bn (raw, 32, NULL);
+  s = BN_bin2bn (raw + 32, 32, NULL);
+  ec_signature = ECDSA_SIG_new ();
+  if (!r || !s || !ec_signature || !ECDSA_SIG_set0 (ec_signature, r, s))
     goto out_error;
-
-  EVP_PKEY_CTX_free (pctx);
-  EVP_MD_CTX_free (mdctx);
-
-  return TRUE;
+  r = s = NULL; /* ECDSA_SIG owns these values. */
+  der_len = i2d_ECDSA_SIG (ec_signature, &der);
+  mdctx = EVP_MD_CTX_new ();
+  if (der_len <= 0 || !mdctx ||
+      EVP_DigestVerifyInit (mdctx, NULL, EVP_sha256 (), NULL, pkey) != 1)
+    goto out_error;
+  if (prefix_len && (!prefix || EVP_DigestVerifyUpdate (mdctx, prefix, prefix_len) != 1))
+    goto out_error;
+  if (data_a && EVP_DigestVerifyUpdate (mdctx, g_bytes_get_data (data_a, NULL),
+                                       g_bytes_get_size (data_a)) != 1)
+    goto out_error;
+  if (data_b && EVP_DigestVerifyUpdate (mdctx, g_bytes_get_data (data_b, NULL),
+                                       g_bytes_get_size (data_b)) != 1)
+    goto out_error;
+  if (EVP_DigestVerifyFinal (mdctx, der, der_len) != 1)
+    goto out_error;
+  valid = TRUE;
+  goto out;
 
 out_error:
   g_propagate_error (error,
                      fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                               "OpenSSL error verifying signature for label '%s'",
-                                               label));
+                                               "SDCP ECDSA signature verification failed"));
   print_openssl_errors ();
-  g_clear_pointer (&pctx, EVP_PKEY_CTX_free);
-  g_clear_pointer (&mdctx, EVP_MD_CTX_free);
-  return FALSE;
+out:
+  BN_free (r);
+  BN_free (s);
+  ECDSA_SIG_free (ec_signature);
+  OPENSSL_free (der);
+  EVP_MD_CTX_free (mdctx);
+  return valid;
 }
-
-static X509_STORE *truststore = NULL;
 
 static X509_STORE *
 fpi_sdcp_get_truststore (GError **error)
 {
-  g_autoptr(GResource) truststore_resource = NULL;
-  const gchar *truststore_resource_path = "/org/freedesktop/fprint/sdcp/truststore/";
-  char **trustcert_names = NULL;
-  gchar *trustcert_path = NULL;
-  GBytes *trustcert_gb = NULL;
-  const gchar *trustcert_ptr;
-  gsize trustcert_len = 0;
-  BIO *bio = NULL;
-  X509 *trustcert = NULL;
+  static gsize initialized = 0;
+  const gchar *base = "/org/freedesktop/fprint/sdcp/truststore/";
+  GResource *resource;
+  g_auto(GStrv) names = NULL;
+  X509_STORE *store = NULL;
 
-  if (truststore)
-    return truststore;
-
-  truststore = X509_STORE_new ();
-  if (!truststore)
+  if (g_once_init_enter (&initialized))
     {
-      g_propagate_error (error,
-                         fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                   "Failed initializing SDCP X509 certificate store"));
-      goto out;
+      fpi_sdcp_truststore_register_resource ();
+      g_once_init_leave (&initialized, 1);
     }
-
-  fpi_sdcp_truststore_register_resource ();
-  truststore_resource = fpi_sdcp_truststore_get_resource ();
-  trustcert_names = g_resources_enumerate_children (truststore_resource_path,
-                                                    G_RESOURCE_LOOKUP_FLAGS_NONE, error);
-  if (*error)
+  /* get_resource() is borrowed for the lifetime of the static resource. */
+  resource = fpi_sdcp_truststore_get_resource ();
+  names = g_resource_enumerate_children (resource, base, 0, error);
+  if (!names)
+    return NULL;
+  store = X509_STORE_new ();
+  if (!store)
+    goto fail;
+  for (guint i = 0; names[i]; i++)
     {
-      g_propagate_error (error,
-                         fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                   "Error loading SDCP truststore certificates: %s",
-                                                   (*error)->message));
-      goto out;
-    }
-  for (int i = 0; trustcert_names[i]; i++)
-    {
-      fp_dbg ("Adding certificate to SDCP truststore: %s", trustcert_names[i]);
-      trustcert_path = g_strconcat (truststore_resource_path, trustcert_names[i], NULL);
-      trustcert_gb = g_resource_lookup_data (truststore_resource, trustcert_path, 0, error);
-      if (*error)
-        {
-          g_propagate_error (error,
-                             fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                       "Error loading SDCP truststore "
-                                                       "certificate '%s': %s",
-                                                       trustcert_names[i], (*error)->message));
-          goto out;
-        }
-      g_free (trustcert_path);
-
-      trustcert_ptr = g_bytes_get_data (trustcert_gb, &trustcert_len);
-      //fp_dbg ("%s:\n%s", trustcert_names[i], trustcert_ptr);
-
-      bio = BIO_new (BIO_s_mem ());
-      if (BIO_write (bio, trustcert_ptr, trustcert_len) != trustcert_len)
-        {
-          g_propagate_error (error,
-                             fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                       "Failed reading '%s' to buffer",
-                                                       trustcert_names[i]));
-          goto out;
-        }
-      g_bytes_unref (trustcert_gb);
-      trustcert = PEM_read_bio_X509 (bio, NULL, NULL, NULL);
-      //print_certificate (trustcert);
-      if (!X509_STORE_add_cert (truststore, trustcert))
-        {
-          g_propagate_error (error,
-                             fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                       "Failed adding '%s' to X509 store",
-                                                       trustcert_names[i]));
-          goto out;
-        }
+      g_autofree gchar *path = g_strconcat (base, names[i], NULL);
+      g_autoptr(GBytes) bytes = g_resource_lookup_data (resource, path, 0, error);
+      BIO *bio;
+      X509 *certificate;
+      int added;
+      if (!bytes)
+        goto fail;
+      bio = BIO_new_mem_buf (g_bytes_get_data (bytes, NULL), g_bytes_get_size (bytes));
+      if (!bio)
+        goto fail;
+      certificate = PEM_read_bio_X509 (bio, NULL, NULL, NULL);
       BIO_free (bio);
-      X509_free (trustcert);
+      if (!certificate)
+        goto fail;
+      added = X509_STORE_add_cert (store, certificate);
+      X509_free (certificate);
+      if (added != 1)
+        goto fail;
     }
-
-  g_strfreev (trustcert_names);
-  g_resource_unref (truststore_resource);
-
-  return truststore;
-
-out:
-  print_openssl_errors ();
-  g_clear_pointer (&trustcert_names, g_strfreev);
-  g_clear_pointer (&trustcert, X509_free);
+  return store;
+fail:
+  if (error && !*error)
+    g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_UNTRUSTED,
+                         "Unable to load complete SDCP trust store");
+  X509_STORE_free (store);
   return NULL;
 }
 
@@ -257,7 +203,7 @@ fpi_sdcp_verify_certificate (X509    *certificate,
   if (!X509_STORE_set1_param (sdcp_truststore, param))
     goto out_error;
 
-  X509_VERIFY_PARAM_free (param);
+  g_clear_pointer (&param, X509_VERIFY_PARAM_free);
   ctx = X509_STORE_CTX_new ();
 
   if(!X509_STORE_CTX_init (ctx, sdcp_truststore, certificate, NULL))
@@ -267,6 +213,7 @@ fpi_sdcp_verify_certificate (X509    *certificate,
     goto out_verify_error;
 
   X509_STORE_CTX_free (ctx);
+  X509_STORE_free (sdcp_truststore);
 
   return TRUE;
 
@@ -284,6 +231,7 @@ out_verify_error:
 out:
   g_clear_pointer (&param, X509_VERIFY_PARAM_free);
   g_clear_pointer (&ctx, X509_STORE_CTX_free);
+  X509_STORE_free (sdcp_truststore);
   return FALSE;
 }
 
@@ -432,12 +380,9 @@ fpi_sdcp_get_private_key (EVP_PKEY *pkey,
   if (!EVP_PKEY_get_bn_param (pkey, OSSL_PKEY_PARAM_PRIV_KEY, &priv_bn))
     goto out_error;
 
-  priv_len = BN_num_bytes (priv_bn);
-  if (priv_len != SDCP_PRIVATE_KEY_SIZE)
-    goto out_error;
-
+  priv_len = SDCP_PRIVATE_KEY_SIZE;
   priv = g_malloc0 (priv_len);
-  if (!BN_bn2bin (priv_bn, priv))
+  if (BN_bn2binpad (priv_bn, priv, priv_len) != priv_len)
     goto out_error;
 
   BN_clear_free (priv_bn);
@@ -775,6 +720,90 @@ fpi_sdcp_generate_random (GError **error)
   return g_steal_pointer (&res);
 }
 
+static gboolean
+sdcp_bytes_size (GBytes *bytes, gsize size)
+{
+  return bytes && g_bytes_get_size (bytes) == size;
+}
+
+static gboolean
+sdcp_claim_has_valid_sizes (FpiSdcpClaim *claim)
+{
+  return claim && claim->model_certificate &&
+    g_bytes_get_size (claim->model_certificate) > 0 &&
+    g_bytes_get_size (claim->model_certificate) <= G_MAXUINT16 &&
+    sdcp_bytes_size (claim->device_public_key, SDCP_PUBLIC_KEY_SIZE) &&
+    sdcp_bytes_size (claim->firmware_public_key, SDCP_PUBLIC_KEY_SIZE) &&
+    sdcp_bytes_size (claim->firmware_hash, SDCP_MAC_SIZE) &&
+    sdcp_bytes_size (claim->model_signature, SDCP_SIGNATURE_SIZE) &&
+    sdcp_bytes_size (claim->device_signature, SDCP_SIGNATURE_SIZE);
+}
+
+gboolean
+fpi_sdcp_verify_attestation (FpiSdcpClaim *claim,
+                              gboolean validate_certificate,
+                              gboolean verify_signatures,
+                              GError **error)
+{
+  static const guint8 firmware_prefix[] = { 0xc0, 0x01 };
+  const guint8 *cert_data, *cert_end;
+  gsize cert_len;
+  X509 *cert = NULL;
+  EVP_PKEY *model_key = NULL, *device_key = NULL;
+  char group[80];
+  gboolean valid = FALSE;
+
+  if (!sdcp_claim_has_valid_sizes (claim))
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                           "Invalid SDCP claim field sizes");
+      return FALSE;
+    }
+  cert_data = g_bytes_get_data (claim->model_certificate, &cert_len);
+  cert_end = cert_data + cert_len;
+  cert = d2i_X509 (NULL, &cert_data, cert_len);
+  if (!cert || cert_data != cert_end)
+    goto invalid;
+  if (validate_certificate && !fpi_sdcp_verify_certificate (cert, error))
+    goto out;
+  if (verify_signatures)
+    {
+      model_key = X509_get_pubkey (cert);
+      if (!model_key || !EVP_PKEY_is_a (model_key, "EC") ||
+          !EVP_PKEY_get_group_name (model_key, group, sizeof (group), NULL) ||
+          (g_strcmp0 (group, "prime256v1") != 0 && g_strcmp0 (group, "P-256") != 0))
+        goto invalid;
+      if (!fpi_sdcp_verify_signature (model_key, NULL, 0,
+                                      claim->device_public_key, NULL,
+                                      claim->model_signature, error))
+        goto out;
+      device_key = fpi_sdcp_get_public_pkey (claim->device_public_key, error);
+      if (!device_key)
+        goto out;
+      if (!fpi_sdcp_verify_signature (device_key, firmware_prefix, sizeof (firmware_prefix),
+                                      claim->firmware_hash, claim->firmware_public_key,
+                                      claim->device_signature, error))
+        goto out;
+    }
+  valid = TRUE;
+  goto out;
+invalid:
+  g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_UNTRUSTED,
+                       "Invalid SDCP model certificate or signing key");
+out:
+  EVP_PKEY_free (device_key);
+  EVP_PKEY_free (model_key);
+  X509_free (cert);
+  return valid;
+}
+
+static gboolean
+sdcp_mac_equal (GBytes *a, GBytes *b)
+{
+  return sdcp_bytes_size (a, SDCP_MAC_SIZE) && sdcp_bytes_size (b, SDCP_MAC_SIZE) &&
+    CRYPTO_memcmp (g_bytes_get_data (a, NULL), g_bytes_get_data (b, NULL), SDCP_MAC_SIZE) == 0;
+}
+
 gboolean
 fpi_sdcp_verify_connect (GBytes       *host_private_key,
                          GBytes       *host_random,
@@ -794,11 +823,19 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
   g_autoptr(GBytes) out_app_secret = NULL;
   guint8 *app_secret_buf = NULL;
 
-  const guint8 *cert_ptr;
-  gsize cert_len = 0;
-  X509 *cert = NULL;
-  EVP_PKEY *cert_public_pkey = NULL;
-  EVP_PKEY *device_public_pkey = NULL;
+
+  if (application_secret)
+    g_clear_pointer (application_secret, g_bytes_unref);
+  if (!application_secret || !sdcp_claim_has_valid_sizes (claim) ||
+      !sdcp_bytes_size (host_private_key, SDCP_PRIVATE_KEY_SIZE) ||
+      !sdcp_bytes_size (host_random, SDCP_RANDOM_SIZE) ||
+      !sdcp_bytes_size (device_random, SDCP_RANDOM_SIZE) ||
+      !sdcp_bytes_size (mac, SDCP_MAC_SIZE))
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                           "Invalid SDCP connection field sizes");
+      return FALSE;
+    }
 
   fp_dbg ("SDCP Verify ConnectResponse");
 
@@ -808,8 +845,6 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
   if (*error)
     goto out_error;
 
-  fp_dbg ("key_agreement:");
-  fp_dbg_hex_dump_gbytes (key_agreement);
 
   /* SDCP Connect: 5.ii. Derive master secret */
 
@@ -818,8 +853,6 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
   if (*error)
     goto out_error;
 
-  fp_dbg ("master_secret:");
-  fp_dbg_hex_dump_gbytes (master_secret);
 
   /* SDCP Connect: 5.iii. Derive MAC secret and symetric key */
 
@@ -828,8 +861,6 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
   if (*error)
     goto out_error;
 
-  fp_dbg ("application_keys:");
-  fp_dbg_hex_dump_gbytes (application_keys);
 
   /* slice first half of application_keys as application_secret */
   g_assert (g_bytes_get_size (application_keys) >= SDCP_APPLICATION_SECRET_SIZE);
@@ -840,8 +871,6 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
 
   out_app_secret = g_bytes_new_take (app_secret_buf, SDCP_APPLICATION_SECRET_SIZE);
 
-  fp_dbg ("application_secret:");
-  fp_dbg_hex_dump_gbytes (out_app_secret);
 
   /* SDCP Connect: 5.iv. Validate the MAC over H(claim) */
 
@@ -859,7 +888,7 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
   fp_dbg ("Host MAC:");
   fp_dbg_hex_dump_gbytes (claim_mac);
 
-  if (g_bytes_equal (mac, claim_mac))
+  if (sdcp_mac_equal (mac, claim_mac))
     {
       fp_dbg ("SDCP ConnectResponse claim validated successfully");
     }
@@ -875,102 +904,9 @@ fpi_sdcp_verify_connect (GBytes       *host_private_key,
   /* SDCP Connect: 5.v. Unpack the claim (SKIP; already done) */
   /* SDCP Connect: 5.vi. Verify the claim */
 
-  if (validate_certificate)
-    {
-      /* Validate the certificate */
-
-      cert_ptr = g_bytes_get_data (claim->model_certificate, &cert_len);
-      cert = d2i_X509 (NULL, &cert_ptr, cert_len);
-      if (!cert)
-        {
-          g_propagate_error (error,
-                             fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                       "Error parsing model certificate"));
-          goto out;
-        }
-
-      print_certificate (cert);
-
-      if (fpi_sdcp_verify_certificate (cert, error))
-        {
-          fp_dbg ("SDCP model ceritifcate verified successfully");
-        }
-      else
-        {
-          fp_dbg ("SDCP model certificate verification failed");
-          goto out;
-        }
-
-      if (verify_signatures)
-        {
-          /* Get the certificate's public key */
-
-          cert_public_pkey = X509_get_pubkey (cert);
-          if (!cert_public_pkey)
-            {
-              g_propagate_error (error,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                           "Error getting public key from "
-                                                           "model certificate"));
-              goto out;
-            }
-
-          /* Verify(pk_m, H(pk_d), s_m) */
-
-          fp_dbg ("model_signature:");
-          fp_dbg_hex_dump_gbytes (claim->model_signature);
-
-          if (!fpi_sdcp_verify_signature (cert_public_pkey,
-                                          NULL,
-                                          claim->device_public_key,
-                                          NULL,
-                                          claim->model_signature,
-                                          error))
-            {
-              g_propagate_error (error,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                           "SDCP model signature verification "
-                                                           "failed"));
-              goto out_error;
-            }
-
-          fp_dbg ("SDCP model signature verified successfully");
-          EVP_PKEY_free (cert_public_pkey);
-
-          /* Verify(pk_d, H(C001||h_f||pk_f), s_d) */
-
-          fp_dbg ("device_public_key:");
-          fp_dbg_hex_dump_gbytes (claim->device_public_key);
-
-          fp_dbg ("firmware_hash:");
-          fp_dbg_hex_dump_gbytes (claim->firmware_hash);
-
-          fp_dbg ("firmware_public_key:");
-          fp_dbg_hex_dump_gbytes (claim->firmware_public_key);
-
-          device_public_pkey = fpi_sdcp_get_public_pkey (claim->device_public_key, error);
-          if (*error)
-            goto out_error;
-
-          if (!fpi_sdcp_verify_signature (device_public_pkey,
-                                          "C001",
-                                          claim->firmware_hash,
-                                          claim->firmware_public_key,
-                                          claim->model_signature,
-                                          error))
-            {
-              g_propagate_error (error,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_UNTRUSTED,
-                                                           "SDCP device signature verification "
-                                                           "failed"));
-              goto out_error;
-            }
-
-          fp_dbg ("SDCP device signature verified successfully");
-          EVP_PKEY_free (device_public_pkey);
-        }
-      X509_free (cert);
-    }
+  if ((validate_certificate || verify_signatures) &&
+      !fpi_sdcp_verify_attestation (claim, validate_certificate, verify_signatures, error))
+    goto out;
 
   /* output application_secret */
 
@@ -986,9 +922,6 @@ out_error:
 out:
   if (!out_app_secret)
     g_clear_pointer (&app_secret_buf, g_free);
-  g_clear_pointer (&device_public_pkey, EVP_PKEY_free);
-  g_clear_pointer (&cert_public_pkey, EVP_PKEY_free);
-  g_clear_pointer (&cert, X509_free);
   return FALSE;
 }
 
@@ -999,6 +932,15 @@ fpi_sdcp_verify_reconnect (GBytes  *application_secret,
                            GError **error)
 {
   g_autoptr(GBytes) host_mac = NULL;
+
+  if (!sdcp_bytes_size (application_secret, 32) ||
+      !sdcp_bytes_size (random, 32) ||
+      !sdcp_bytes_size (mac, 32))
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                           "Invalid SDCP authentication field sizes");
+      return FALSE;
+    }
 
   fp_dbg ("SDCP Verify ReconnectResponse");
 
@@ -1012,7 +954,7 @@ fpi_sdcp_verify_reconnect (GBytes  *application_secret,
   fp_dbg ("Host MAC:");
   fp_dbg_hex_dump_gbytes (host_mac);
 
-  if (g_bytes_equal (mac, host_mac))
+  if (sdcp_mac_equal (mac, host_mac))
     {
       fp_dbg ("SDCP ReconnectResponse verified successfully");
       return TRUE;
@@ -1035,6 +977,16 @@ fpi_sdcp_verify_identify (GBytes  *application_secret,
 {
   g_autoptr(GBytes) host_mac = NULL;
 
+  if (!sdcp_bytes_size (application_secret, 32) ||
+      !sdcp_bytes_size (nonce, 32) ||
+      !sdcp_bytes_size (id, 32) ||
+      !sdcp_bytes_size (mac, 32))
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                           "Invalid SDCP authentication field sizes");
+      return FALSE;
+    }
+
   fp_dbg ("SDCP Verify AuthorizedIdentity");
 
   host_mac = fpi_sdcp_mac (application_secret, "identify", nonce, id, error);
@@ -1047,7 +999,7 @@ fpi_sdcp_verify_identify (GBytes  *application_secret,
   fp_dbg ("Host MAC:");
   fp_dbg_hex_dump_gbytes (host_mac);
 
-  if (g_bytes_equal (mac, host_mac))
+  if (sdcp_mac_equal (mac, host_mac))
     {
       fp_dbg ("SDCP AuthorizedIdentity verified successfully");
       return TRUE;

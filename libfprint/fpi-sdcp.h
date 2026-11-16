@@ -130,3 +130,9 @@ gboolean fpi_sdcp_verify_identify (GBytes  *application_secret,
 GBytes *fpi_sdcp_generate_enrollment_id (GBytes  *application_secret,
                                          GBytes  *nonce,
                                          GError **error);
+
+/* Internal attestation verification, also exercised independently by tests. */
+gboolean fpi_sdcp_verify_attestation (FpiSdcpClaim *claim,
+                                      gboolean validate_certificate,
+                                      gboolean verify_signatures,
+                                      GError **error);

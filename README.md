@@ -1,3 +1,14 @@
+# Egis SDCP hardening fork
+
+This personal fork contains security fixes on top of the official [SDCP v2 proposal](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/547), commit `2d7c5277de08c6b29b3fac7447f17a516fbc4d1c`.
+The imported upstream tree is recorded separately from the local security changes. Original authorship and LGPL licensing are preserved.
+
+**Development build:** security regression tests and ASan/UBSan checks pass; registration and unlock on an actual `1c7a:05a1` device are still awaiting validation. This is not an official Ubuntu release or a complete security audit.
+
+See [setup, verification, rollback, and known limits](local-setup/README.md). The original libfprint overview follows.
+
+---
+
 
 
 <div align="center">

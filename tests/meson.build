@@ -269,6 +269,7 @@ endif
 if 'sdcp' in driver_helpers
     unit_tests += [
         'fpi-sdcp',
+        'fpi-sdcp-hardening',
     ]
 endif
 

@@ -31,6 +31,7 @@
 #include "fpi-byte-writer.h"
 
 #include "egismoc.h"
+#include "egismoc-proto.h"
 
 struct _FpiDeviceEgisMoc
 {
@@ -84,17 +85,24 @@ typedef struct egismoc_identify_print
   GError *error;
 } IdentifyPrint;
 
+static void
+identify_print_free (gpointer data)
+{
+  IdentifyPrint *print = data;
+  g_clear_pointer (&print->id, g_bytes_unref);
+  g_clear_pointer (&print->mac, g_bytes_unref);
+  g_clear_error (&print->error);
+  g_free (print);
+}
+
 static gboolean
 egismoc_validate_response_prefix (const guchar *buffer_in,
                                   const gsize   buffer_in_len,
                                   const guchar *valid_prefix,
                                   const gsize   valid_prefix_len)
 {
-  const gboolean result = memcmp (buffer_in +
-                                  (egismoc_read_prefix_len +
-                                   EGISMOC_CHECK_BYTES_LENGTH),
-                                  valid_prefix,
-                                  valid_prefix_len) == 0;
+  const gboolean result = egismoc_has_prefix (buffer_in, buffer_in_len,
+    egismoc_read_prefix_len + EGISMOC_CHECK_BYTES_LENGTH, valid_prefix, valid_prefix_len);
 
   fp_dbg ("Response prefix valid: %s", result ? "yes" : "NO");
   return result;
@@ -106,9 +114,8 @@ egismoc_validate_response_suffix (const guchar *buffer_in,
                                   const guchar *valid_suffix,
                                   const gsize   valid_suffix_len)
 {
-  const gboolean result = memcmp (buffer_in + (buffer_in_len - valid_suffix_len),
-                                  valid_suffix,
-                                  valid_suffix_len) == 0;
+  const gboolean result = egismoc_has_suffix (buffer_in, buffer_in_len,
+                                                valid_suffix, valid_suffix_len);
 
   fp_dbg ("Response suffix valid: %s", result ? "yes" : "NO");
   return result;
@@ -363,8 +370,13 @@ egismoc_wait_finger_ssm_done (FpiSsm   *ssm,
   self->wait_finger_ssm = NULL;
   self->wait_finger_start = 0;
 
-  if (error && g_strcmp0 (error->message, "Operation was cancelled") != 0)
-    fpi_device_action_error (device, error);
+  if (error)
+    {
+      if (self->task_ssm)
+        fpi_ssm_mark_failed (self->task_ssm, error);
+      else
+        g_error_free (error);
+    }
 }
 
 static void
@@ -384,7 +396,8 @@ egismoc_finger_on_sensor_cb (FpiUsbTransfer *transfer,
     }
 
   /* finger is "present" when buffer begins with "SIGE" and ends in valid suffix */
-  if (memcmp (transfer->buffer, egismoc_read_prefix, 4) == 0 &&
+  if (egismoc_has_prefix (transfer->buffer, transfer->actual_length, 0,
+                           egismoc_read_prefix, egismoc_read_prefix_len) &&
       egismoc_validate_response_suffix (transfer->buffer,
                                         transfer->actual_length,
                                         rsp_sensor_has_finger_suffix,
@@ -1007,6 +1020,13 @@ egismoc_enroll_starting_cb (FpDevice *device,
       return;
     }
 
+  if (length_in < EGISMOC_ENROLL_STARTING_RESPONSE_PREFIX_SIZE + SDCP_NONCE_SIZE + rsp_enroll_starting_suffix_len)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID, "Truncated enrollment nonce response"));
+      return;
+    }
+
   /* clear and fetch SDCP device enrollment nonce from response */
   g_clear_pointer (&self->enrollment_nonce, g_bytes_unref);
   self->enrollment_nonce = g_bytes_new (buffer_in
@@ -1276,30 +1296,20 @@ egismoc_enroll (FpSdcpDevice *sdcp_device)
 
 static void
 egismoc_identify_complete_cb (FpDevice *device,
-                              guchar   *buffer_in,
-                              gsize     length_in,
-                              GError   *error)
+                              guchar *buffer_in,
+                              gsize length_in,
+                              GError *error)
 {
-  fp_dbg ("Identify complete callback");
   FpiDeviceEgisMoc *self = FPI_DEVICE_EGISMOC (device);
-  FpSdcpDevice *sdcp_device = FP_SDCP_DEVICE (device);
-  IdentifyPrint *identify_print = fpi_ssm_get_data (self->task_ssm);
-
+  IdentifyPrint *print = fpi_ssm_get_data (self->task_ssm);
   if (error)
     {
-      fpi_device_action_error (device, error);
-      goto out;
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
     }
-
-  fpi_sdcp_device_identify_complete (sdcp_device, identify_print->id, identify_print->mac,
-                                     identify_print->error);
-
+  fpi_sdcp_device_identify_complete (FP_SDCP_DEVICE (device), print->id, print->mac,
+                                     g_steal_pointer (&print->error));
   fpi_ssm_next_state (self->task_ssm);
-
-out:
-  g_clear_pointer (&identify_print->id, g_bytes_unref);
-  g_clear_pointer (&identify_print->mac, g_bytes_unref);
-  g_clear_pointer (&identify_print, g_free);
 }
 
 static void
@@ -1320,7 +1330,7 @@ egismoc_identify_check_cb (FpDevice *device,
 
   if (error)
     {
-      fpi_device_action_error (device, error);
+      fpi_ssm_mark_failed (self->task_ssm, error);
       return;
     }
 
@@ -1343,6 +1353,13 @@ egismoc_identify_check_cb (FpDevice *device,
          but on egismoc devices there is a prefix, followed by (m,id) (yes, it
          is backwards), followed by a suffix.
        */
+      if (length_in < EGISMOC_IDENTIFY_RESPONSE_PREFIX_SIZE + SDCP_MAC_SIZE +
+                       SDCP_ENROLLMENT_ID_SIZE + rsp_identify_match_suffix_len)
+        {
+          fpi_ssm_mark_failed (self->task_ssm,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID, "Truncated identification response"));
+          return;
+        }
       identify_print->mac = g_bytes_new (buffer_in
                                          + EGISMOC_IDENTIFY_RESPONSE_PREFIX_SIZE,
                                          SDCP_MAC_SIZE);
@@ -1430,7 +1447,7 @@ egismoc_identify (FpSdcpDevice *sdcp_device)
   self->task_ssm = fpi_ssm_new (FP_DEVICE (sdcp_device),
                                 egismoc_identify_run_state,
                                 IDENTIFY_STATES);
-  fpi_ssm_set_data (self->task_ssm, g_steal_pointer (&identify_print), NULL);
+  fpi_ssm_set_data (self->task_ssm, g_steal_pointer (&identify_print), identify_print_free);
   fpi_ssm_start (self->task_ssm, egismoc_task_ssm_done);
 }
 
@@ -1448,10 +1465,8 @@ egismoc_connect_cb (FpDevice *device,
   fp_dbg ("SDCP ConnectResponse callback");
   FpSdcpDevice *sdcp_device = FP_SDCP_DEVICE (device);
   g_autoptr(GBytes) device_random = NULL;
-  gsize model_certificate_len = 0;
   g_autoptr(FpiSdcpClaim) claim = NULL;
   g_autoptr(GBytes) mac = NULL;
-  int pos = EGISMOC_CONNECT_RESPONSE_PREFIX_SIZE;
 
   if (error)
     {
@@ -1472,65 +1487,15 @@ egismoc_connect_cb (FpDevice *device,
       return;
     }
 
-  /* buf len should be at least larger than all required parts (plus a cert) */
-  if (length_in <= SDCP_RANDOM_SIZE
-      + SDCP_PUBLIC_KEY_SIZE
-      + SDCP_PUBLIC_KEY_SIZE
-      + SDCP_RANDOM_SIZE
-      + SDCP_SIGNATURE_SIZE
-      + SDCP_SIGNATURE_SIZE
-      + SDCP_MAC_SIZE)
+  if (length_in < EGISMOC_CONNECT_RESPONSE_PREFIX_SIZE + rsp_sdcp_connect_success_suffix_len ||
+      !egismoc_parse_connect (buffer_in + EGISMOC_CONNECT_RESPONSE_PREFIX_SIZE,
+                               length_in - EGISMOC_CONNECT_RESPONSE_PREFIX_SIZE - rsp_sdcp_connect_success_suffix_len,
+                               &device_random, &claim, &mac))
     {
       fpi_sdcp_device_connect_complete (sdcp_device, NULL, NULL, NULL,
-                                        fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
-                                                                  "Device SDCP ConnectResponse "
-                                                                  "was not long enough"));
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID, "Invalid SDCP response length"));
       return;
     }
-
-
-  /*
-   * Parse ConnectResponse parts; unfortunately these devices return a somewhat
-   * non-standard ConnectResponse as there are two bytes indicating cert_m's
-   * length which must be handled.
-   */
-  claim = g_new0 (FpiSdcpClaim, 1);
-
-  /* r_d */
-  device_random = g_bytes_new (buffer_in + pos, SDCP_RANDOM_SIZE);
-  pos += SDCP_RANDOM_SIZE;
-
-  /* next two bytes are an unsigned short giving the cert_m length */
-  model_certificate_len = buffer_in[pos] << 8 | buffer_in[pos + 1];
-  pos += 2;
-
-  /* cert_m bytes based on length fetched above */
-  claim->model_certificate = g_bytes_new (buffer_in + pos, model_certificate_len);
-  pos += model_certificate_len;
-
-  /* pk_d */
-  claim->device_public_key = g_bytes_new (buffer_in + pos, SDCP_PUBLIC_KEY_SIZE);
-  pos += SDCP_PUBLIC_KEY_SIZE;
-
-  /* pk_f */
-  claim->firmware_public_key = g_bytes_new (buffer_in + pos, SDCP_PUBLIC_KEY_SIZE);
-  pos += SDCP_PUBLIC_KEY_SIZE;
-
-  /* h_f */
-  claim->firmware_hash = g_bytes_new (buffer_in + pos, SDCP_MAC_SIZE);
-  pos += SDCP_MAC_SIZE;
-
-  /* s_m */
-  claim->model_signature = g_bytes_new (buffer_in + pos, SDCP_SIGNATURE_SIZE);
-  pos += SDCP_SIGNATURE_SIZE;
-
-  /* s_d */
-  claim->device_signature = g_bytes_new (buffer_in + pos, SDCP_SIGNATURE_SIZE);
-  pos += SDCP_SIGNATURE_SIZE;
-
-  /* m */
-  mac = g_bytes_new (buffer_in + pos, SDCP_MAC_SIZE);
-  pos += SDCP_MAC_SIZE;
 
   /* Derive SDCP keys and establish secured connection */
   fpi_sdcp_device_connect_complete (sdcp_device, device_random, claim, mac, error);
@@ -1658,6 +1623,12 @@ egismoc_fw_version_cb (FpDevice *device,
    * all but the last 2 bytes as the FW Version
    */
   prefix_length = egismoc_read_prefix_len + 2 + 3 + 1;
+  if (length_in < prefix_length + rsp_fw_version_suffix_len)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID, "Truncated firmware version response"));
+      return;
+    }
   fw_version_start = buffer_in + prefix_length;
   fw_version_length = length_in - prefix_length - rsp_fw_version_suffix_len;
   fw_version = g_strndup ((gchar *) fw_version_start, fw_version_length);
@@ -1779,9 +1750,14 @@ egismoc_cancel (FpDevice *device)
   self->interrupt_cancellable = g_cancellable_new ();
 
   /* Terminate ongoing action if cancel is called */
-  if (self->task_ssm)
-    fpi_ssm_mark_failed (self->task_ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                                                   "Operation was cancelled"));
+  /* OPEN also has control transfers that point directly at task_ssm. */
+  if (self->cmd_ssm || fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_OPEN)
+    g_cancellable_cancel (fpi_device_get_cancellable (device));
+  /* Let outstanding USB/interrupt callbacks finish their state machines. */
+  if (self->task_ssm && !self->wait_finger_ssm && !self->cmd_ssm &&
+      fpi_device_get_current_action (device) != FPI_DEVICE_ACTION_OPEN)
+    fpi_ssm_mark_failed (self->task_ssm,
+      g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Operation cancelled"));
 }
 
 static void
@@ -1915,6 +1891,7 @@ fpi_device_egismoc_class_init (FpiDeviceEgisMocClass *klass)
   fpi_device_class_auto_initialize_features (dev_class);
   dev_class->features |= FP_DEVICE_FEATURE_DUPLICATES_CHECK;
 
+  sdcp_dev_class->require_fresh_connect = TRUE;
   sdcp_dev_class->ignore_device_certificate = FALSE;
   sdcp_dev_class->ignore_device_signatures = FALSE;
 }
