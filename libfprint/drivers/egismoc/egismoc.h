@@ -1,14 +1,9 @@
 /*
  * Driver for Egis Technology (LighTuning) Match-On-Chip sensors
- * Originally authored 2023 by Joshua Grisham <josh@joshuagrisham.com>
+ * Copyright (C) 2023-2025 Joshua Grisham <josh@joshuagrisham.com>
  *
  * Portions of code and logic inspired from the elanmoc libfprint driver
  * which is copyright (C) 2021 Elan Microelectronics Inc (see elanmoc.c)
- *
- * Based on original reverse-engineering work by Joshua Grisham. The protocol has
- * been reverse-engineered from captures of the official Windows driver, and by
- * testing commands on the sensor with a multiplatform Python prototype driver:
- * https://github.com/joshuagrisham/galaxy-book2-pro-linux/tree/main/fingerprint/
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -27,10 +22,11 @@
 
 #pragma once
 
-#include "fpi-sdcp-device.h"
 #include "fpi-ssm.h"
 
-G_DECLARE_FINAL_TYPE (FpiDeviceEgisMoc, fpi_device_egismoc, FPI, DEVICE_EGISMOC, FpiSdcpDevice)
+#include "fpi-sdcp-device.h"
+
+G_DECLARE_FINAL_TYPE (FpiDeviceEgisMoc, fpi_device_egismoc, FPI, DEVICE_EGISMOC, FpSdcpDevice)
 
 #define EGISMOC_DRIVER_FULLNAME "Egis Technology (LighTuning) Match-on-Chip"
 
@@ -186,13 +182,18 @@ typedef enum {
 } DeviceInitStates;
 
 typedef enum {
+  CONNECT,
+  CONNECT_RESPONSE,
+  CONNECT_STATES,
+} ConnectStates;
+
+typedef enum {
   WAIT_FINGER_NOT_ON_SENSOR,
   WAIT_FINGER_ON_SENSOR,
   WAIT_FINGER_STATES,
 } WaitFingerStates;
 
 typedef enum {
-  IDENTIFY_SDCP_CONNECT,
   IDENTIFY_GET_ENROLLED_IDS,
   IDENTIFY_CHECK_ENROLLED_NUM,
   IDENTIFY_SENSOR_RESET,
@@ -200,13 +201,10 @@ typedef enum {
   IDENTIFY_WAIT_FINGER,
   IDENTIFY_SENSOR_CHECK,
   IDENTIFY_CHECK,
-  IDENTIFY_COMPLETE_SENSOR_RESET,
-  IDENTIFY_COMPLETE,
   IDENTIFY_STATES,
 } IdentifyStates;
 
 typedef enum {
-  ENROLL_SDCP_CONNECT,
   ENROLL_GET_ENROLLED_IDS,
   ENROLL_CHECK_ENROLLED_NUM,
   ENROLL_SENSOR_RESET,
@@ -222,8 +220,6 @@ typedef enum {
   ENROLL_CAPTURE_READ_RESPONSE,
   ENROLL_COMMIT_START,
   ENROLL_COMMIT,
-  ENROLL_COMMIT_SENSOR_RESET,
-  ENROLL_COMPLETE,
   ENROLL_STATES,
 } EnrollStates;
 

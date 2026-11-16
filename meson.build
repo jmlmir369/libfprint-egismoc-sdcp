@@ -1,5 +1,5 @@
 project('libfprint', [ 'c', 'cpp' ],
-    version: '1.94.9',
+    version: '1.94.10',
     license: 'LGPLv2.1+',
     default_options: [
         'buildtype=debugoptimized',
@@ -95,7 +95,6 @@ gio_dep = dependency('gio-unix-2.0', version: '>=' + glib_min_version)
 gobject_dep = dependency('gobject-2.0', version: '>=' + glib_min_version)
 gusb_dep = dependency('gusb', version: '>= 0.2.0')
 mathlib_dep = cc.find_library('m', required: false)
-openssl_dep = dependency('openssl', version: '>= 3.0.8') # 3.0.8 or higher as SDCP requires using uncompressed EC keys
 
 # The following dependencies are only used for tests
 sh = find_program('sh', required: true)
@@ -113,8 +112,8 @@ virtual_drivers = [
     'virtual_image',
     'virtual_device',
     'virtual_device_storage',
+    'virtual_sdcp',
 ]
-
 default_drivers = [
     'upektc_img',
     'vfs5011',
@@ -210,11 +209,13 @@ driver_helper_mapping = {
     'aes2660' : [ 'aeslib', 'aesx660' ],
     'aes3500' : [ 'aeslib', 'aes3k' ],
     'aes4000' : [ 'aeslib', 'aes3k' ],
-    'uru4000' : [ 'openssl' ],
+    'egismoc' : [ 'sdcp' ],
     'elanspi' : [ 'udev' ],
+    'uru4000' : [ 'openssl' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
     'virtual_device_storage' : [ 'virtual' ],
+    'virtual_sdcp'           : [ 'virtual', 'sdcp' ],
 }
 
 driver_helpers = []
@@ -268,9 +269,16 @@ foreach i : driver_helpers
         libfprint_conf.set10('HAVE_PIXMAN', true)
         optional_deps += imaging_dep
     elif i == 'openssl'
-        openssl_dep = dependency('openssl', version: '>= 3.0.8', required: false)
+        openssl_dep = dependency('openssl', version: '>= 3.0', required: false)
         if not openssl_dep.found()
             error('OpenSSL is required for @0@ and possibly others'.format(driver))
+        endif
+
+        optional_deps += openssl_dep
+    elif i == 'sdcp'
+        openssl_dep = dependency('openssl', version: '>= 3.0.8', required: false)
+        if not openssl_dep.found()
+            error('OpenSSL >= 3.0.8 is required for SDCP support (@0@ and possibly others)'.format(driver))
         endif
 
         optional_deps += openssl_dep
